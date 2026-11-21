@@ -81,5 +81,32 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 查询改写与代价估算批次
+
+`POST /api/pipelines/rewrite-estimate-execute` 把查询语句、改写规则、模型版本
+和代价估算收进同一个「改写与代价估算批次」，阶段依次为
+`freeze_version → rewrite → estimate → federate → publish_decision`。
+
+- 批次号由查询 + 冻结的模型/规则签名推导，同一组合重跑命中同一批次：
+  命中次数只记一次，成本记录与改写缓存按批次幂等，不重复叠加节省量。
+- 扫描预测由实际命中的规则（代价阈值）确定性推导，不依赖随机数，
+  因此成本预估可以回溯到同一次查询构建。
+- 批次的模型版本指纹写入改写缓存、成本记录和联邦计划；估算结果回写批次
+  清单后，计划才有 `对外公布` 标记，`execute_federation_query` 只放行这类计划。
+- 节省量按「本次估算 − 历史已结算基线」记增量，兼容旧布局（`适用角色=query_rewrite`
+  且节省量存于 `查询上限` 的历史记录）。
+
+断点续跑与版本漂移示例：
+
+```bash
+# 1. 改写完成、估算尚未写入时中断
+curl -X POST 'http://127.0.0.1:8000/api/pipelines/rewrite-estimate-execute?query=SELECT%20*%20FROM%20source_registry&stop_before=estimate'
+# 2. 期间上线一套新模型（如调用语义模型接口投产）
+# 3. 用返回的 batch_id / run_id 续跑：检出 model_added 漂移，公布被拒绝
+curl -X POST 'http://127.0.0.1:8000/api/pipelines/rewrite-estimate-execute?query=...&batch_id=REB-xxx&run_id=yyy'
+# 4. 确认沿用冻结版本后公布并进入执行
+curl -X POST 'http://127.0.0.1:8000/api/pipelines/rewrite-estimate-execute/REB-xxx/acknowledge-drift'
+```
+
 领域：数据工程
 子方向：数据分析与数据应用

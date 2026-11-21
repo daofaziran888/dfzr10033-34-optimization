@@ -97,6 +97,7 @@ from app.services.query_audit import QueryAuditService
 from app.services.cost_govern import CostGovernService
 from app.services.data_contract import DataContractService
 from app.services.semantic_model import SemanticModelService
+from app.services import batch_store, rewrite_estimate
 
 source_svc = SourceRegistryService()
 semantic_svc = SemanticModelService()
@@ -158,14 +159,103 @@ def pipeline_cube_build_cache(
 def pipeline_rewrite_estimate_execute(
     query: str = Query(default="SELECT * FROM source_registry"),
     model_ids: str = Query(default=""),
+    sources: str = Query(default="source_registry"),
+    stop_before: str | None = Query(default=None),
+    batch_id: str | None = Query(default=None),
+    run_id: str | None = Query(default=None),
+    publish: bool = Query(default=True),
 ) -> dict[str, Any]:
+    """查询改写 → 代价估算 → 联邦计划 → 公布执行 的完整批次流水线。
+
+    - ``stop_before``：在指定阶段前中断，用于模拟“改写完、估算未写”的断点；
+    - ``batch_id``（+ 可选 ``run_id``）：从中断处续跑，已成功阶段不会重跑；
+    - ``publish``：估算回写清单后是否对外公布，决定计划能否进入执行。
+    """
     mids = [int(m) for m in model_ids.split(",") if m.strip()] if model_ids else None
-    rr = rewrite_svc.rewrite_query(query, mids)
-    cr = federation_svc.estimate_query_cost(["source_registry"], "SELECT")
-    return {"ok": True, "pipeline": "rewrite_estimate_execute", "rewrite": rr, "cost_estimate": cr,
-            "execution_summary": {"original": query, "rewritten": rr["rewritten"],
-                                  "rules_applied": rr["rules_applied"],
-                                  "estimated_savings": rr["estimated_savings_rows"]}}
+    source_list = [s.strip() for s in sources.split(",") if s.strip()]
+
+    try:
+        if batch_id:
+            outcome = rewrite_estimate.resume_batch(
+                batch_id, run_id, stop_before=stop_before)
+        else:
+            outcome = rewrite_estimate.run(
+                query, mids, source_list, stop_before=stop_before)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    batch = outcome["batch"]
+    run_obj = outcome["run"]
+    decision: dict[str, Any] | None = None
+    if publish and run_obj.status == "completed":
+        decision = rewrite_estimate.publish(batch)
+
+    manifest = batch.manifest()
+    return {
+        "ok": run_obj.status in ("completed", "interrupted"),
+        "pipeline": "rewrite_estimate_execute",
+        "batch_id": batch.batch_id,
+        "run_id": run_obj.run_id,
+        "run_status": run_obj.status,
+        "stages": [
+            {"stage": stage.stage, "module": stage.module, "ok": stage.ok,
+             "duration_ms": round(stage.duration_ms, 2), "error": stage.error}
+            for stage in run_obj.stages
+        ],
+        "next_stage": (
+            run_obj.stage_specs[run_obj.next_stage_index][0]
+            if run_obj.next_stage_index < len(run_obj.stage_specs) else None
+        ),
+        "model_version": batch.model_version,
+        "conflicts": batch.conflicts,
+        "manifest": manifest,
+        "rewrite": {
+            "original": batch.raw_query,
+            "rewritten": (batch.rewrite or {}).get("rewritten"),
+            "rules_applied": (batch.rewrite or {}).get("rules_applied"),
+            "rule_trace": (batch.rewrite or {}).get("rule_trace", []),
+            "cache_id": batch.cache_id,
+        },
+        "cost_estimate": batch.estimate,
+        "settlement": batch.settlement,
+        "publish": decision,
+        "executable": rewrite_estimate.plan_executable(batch),
+        "execution_summary": {
+            "original": batch.raw_query,
+            "rewritten": (batch.rewrite or {}).get("rewritten"),
+            "rules_applied": (batch.rewrite or {}).get("rules_applied", 0),
+            "estimated_savings": (batch.prediction or {}).get("estimated_savings_rows", 0),
+        },
+    }
+
+
+@router.get("/pipelines/rewrite-estimate-execute/{batch_id}")
+def get_rewrite_estimate_batch(batch_id: str) -> dict[str, Any]:
+    batch = batch_store.get(batch_id)
+    if batch is None:
+        raise HTTPException(status_code=404, detail=f"批次不存在：{batch_id}")
+    return {"ok": True, "batch_id": batch_id, **rewrite_estimate.batch_view(batch)}
+
+
+@router.post("/pipelines/rewrite-estimate-execute/{batch_id}/acknowledge-drift")
+def acknowledge_rewrite_estimate_drift(
+    batch_id: str, note: str = Query(default=""),
+) -> dict[str, Any]:
+    """确认沿用冻结版本继续完成批次，而不是从新模型重跑。"""
+    batch = batch_store.get(batch_id)
+    if batch is None:
+        raise HTTPException(status_code=404, detail=f"批次不存在：{batch_id}")
+    rewrite_estimate.acknowledge_drift(batch, note)
+    return {"ok": True, "batch_id": batch_id, "conflicts": batch.conflicts,
+            "status": batch.status}
+
+
+@router.post("/pipelines/rewrite-estimate-execute/{batch_id}/publish")
+def publish_rewrite_estimate_batch(batch_id: str) -> dict[str, Any]:
+    batch = batch_store.get(batch_id)
+    if batch is None:
+        raise HTTPException(status_code=404, detail=f"批次不存在：{batch_id}")
+    return rewrite_estimate.publish(batch)
 
 
 @router.post("/pipelines/query-audit-profile")

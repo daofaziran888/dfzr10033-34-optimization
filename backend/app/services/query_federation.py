@@ -8,6 +8,8 @@ import uuid
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.settlement import settle
+from app.services.versioning import query_key
 from app.store import store
 
 
@@ -46,10 +48,22 @@ class QueryFederationService(BaseModuleService):
         return plan
 
     def execute_federation_query(self, plan_id: int) -> dict[str, Any]:
-        """执行联邦查询：读取 source_registry 和 query_rewrite，写入 result_cache 和 query_audit。"""
+        """执行联邦查询：读取 source_registry 和 query_rewrite，写入 result_cache 和 query_audit。
+
+        由改写与代价估算批次创建的计划，必须等批次公布（估算已回写清单）
+        且模型版本没有被替换后才能进入执行。
+        """
         plan = store.find(self.MODULE, plan_id)
         if plan is None:
             return {"ok": False, "message": "查询计划不存在"}
+
+        batch_id = plan.get("批次编号")
+        if batch_id and plan.get("对外公布") != batch_id:
+            return {
+                "ok": False,
+                "message": "批次尚未公布或估算未回写清单，计划不能进入执行",
+                "batch_id": batch_id,
+            }
 
         sources = [s.strip() for s in plan.get("参与来源", "").split(",") if s.strip()]
         if not sources:
@@ -77,12 +91,12 @@ class QueryFederationService(BaseModuleService):
         t0 = time.time()
         result_rows = _simulate_federated_query(sources, plan.get("谓词下推策略", ""))
 
-        # 写入结果缓存
-        _cache_query_result(plan_id, result_rows)
+        # 写入结果缓存（模型版本随计划一起带到缓存上）
+        _cache_query_result(plan_id, result_rows, plan)
 
         # 写入查询审计
         elapsed_ms = (time.time() - t0) * 1000
-        _audit_federated_query(plan_id, elapsed_ms, len(result_rows))
+        _audit_federated_query(plan_id, elapsed_ms, len(result_rows), plan)
 
         # 更新多维立方数据（如果涉及）
         _update_cube_if_needed(plan_id, result_rows)
@@ -99,34 +113,108 @@ class QueryFederationService(BaseModuleService):
             "elapsed_ms": elapsed_ms,
             "results": result_rows[:10],
             "cache_key": _cache_key(plan_id),
+            "batch_id": batch_id,
+            "model_version": plan.get("模型版本"),
         }
 
-    def estimate_query_cost(self, sources: list[str], query_type: str) -> dict[str, Any]:
-        """对联邦查询做代价估算，写入 cost_govern 配额记录。"""
+    def estimate_query_cost(
+        self,
+        sources: list[str],
+        query_type: str,
+        *,
+        prediction: dict[str, Any] | None = None,
+        rules: list[dict[str, Any]] | None = None,
+        batch_id: str | None = None,
+        raw_query: str = "",
+        model_version: dict[str, Any] | None = None,
+        rule_signature: str = "",
+        baseline: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """对联邦查询做代价估算，写入 cost_govern 配额记录。
+
+        ``prediction`` 来自改写环节由实际规则算出的扫描预测；不传时才回退到
+        按数据源规模估算。带 ``batch_id`` 时以批次为幂等键：中断后重试复用
+        同一条成本记录，不会把节省量重复叠加。
+        """
         available = [s for s in store.rows("source_registry") if s.get("status") == "已注册"]
         pushdown = _infer_pushdown_strategy(sources, available)
         cost = _estimate_cost(sources, query_type, pushdown)
+        if prediction is not None:
+            scan_rows = int(prediction.get("estimated_scan_rows", 0))
+            savings = int(prediction.get("estimated_savings_rows", 0))
+            settlement = settle(baseline, savings)
+        else:
+            scan_rows = int(cost["estimated_rows"])
+            savings = 0
+            settlement = {
+                "baseline_rows": 0, "previous_savings": 0,
+                "incremental_rows": 0, "cumulative_savings": 0,
+            }
 
-        # 写入成本治理模块
         cost_rows = store.rows("cost_govern")
+        if batch_id:
+            for row in cost_rows:
+                if row.get("批次编号") == batch_id and row.get("适用角色") == "rewrite_estimate":
+                    return {
+                        "ok": True,
+                        "cost": cost,
+                        "scan_prediction": prediction,
+                        "settlement": _row_settlement(row, settlement),                        "cost_entry_id": row["id"],
+                        "reused": True,
+                        "batch_id": batch_id,
+                    }
+
         cost_id = max((int(r.get("id", 0)) for r in cost_rows), default=0) + 1
         cost_entry = {
             "id": cost_id,
-            "策略编号": f"COST-{uuid.uuid4().hex[:8]}",
-            "适用角色": "federated_query",
-            "查询上限": str(cost["estimated_rows"]),
+            "策略编号": f"COST-{batch_id or uuid.uuid4().hex[:8]}",
+            "适用角色": "rewrite_estimate" if prediction is not None else "federated_query",
+            "查询上限": str(scan_rows),
             "并发上限": str(len(sources)),
-            "月度配额": str(cost["estimated_rows"] * 30),
-            "告警阈值": str(cost["estimated_rows"] * 2),
-            "限流动作": "record_only",
+            "月度配额": str(scan_rows * 30),
+            "告警阈值": str(scan_rows * 2),
+            "限流动作": "settle_savings" if prediction is not None else "record_only",
             "生效时段": time.strftime("%Y-%m-%d"),
             "status": "已生效",
             "pending": False,
-            "abnormal": cost["estimated_rows"] > 100000,
+            "abnormal": scan_rows > 100000,
+            "批次编号": batch_id,
+            "查询摘要键": query_key(raw_query) if raw_query else None,
+            "规则编号": [rule.get("规则编号") for rule in (rules or [])],
+            "模型版本": (model_version or {}).get("signature"),
+            "规则签名": rule_signature or (model_version or {}).get("rule_signature"),
+            "扫描预测": scan_rows,
+            "扫描行数": str(scan_rows),
+            "节省量": savings,
+            "节省行数": settlement["incremental_rows"],
+            "结算基线": settlement["baseline_rows"],
+            "结算累计": settlement["cumulative_savings"],
         }
         cost_rows.append(cost_entry)
 
-        return {"ok": True, "cost": cost, "cost_entry_id": cost_id}
+        return {
+            "ok": True,
+            "cost": cost,
+            "scan_prediction": prediction,
+            "settlement": settlement,
+            "cost_entry_id": cost_id,
+            "reused": False,
+            "batch_id": batch_id,
+        }
+
+
+def _row_settlement(row: dict[str, Any], fallback: dict[str, Any]) -> dict[str, Any]:
+    """重试命中已有成本记录时，按已落盘的值回报结算结果。"""
+    try:
+        return {
+            "baseline_rows": int(row.get("结算基线", fallback.get("baseline_rows", 0)) or 0),
+            "previous_savings": int(row.get("结算累计", 0) or 0)
+            - int(row.get("节省行数", 0) or 0),
+            "incremental_rows": int(row.get("节省行数", 0) or 0),
+            "cumulative_savings": int(row.get("结算累计", 0) or 0),
+        }
+    except (ValueError, TypeError):
+        return fallback
 
 
 # ---------- 跨模块辅助函数 ----------
@@ -213,10 +301,15 @@ def _simulate_federated_query(sources: list[str], strategy: str) -> list[dict[st
     return rows
 
 
-def _cache_query_result(plan_id: int, results: list[dict[str, Any]]) -> None:
+def _cache_query_result(
+    plan_id: int,
+    results: list[dict[str, Any]],
+    plan: dict[str, Any] | None = None,
+) -> None:
     rows = store.rows("result_cache")
     cache_id = max((int(r.get("id", 0)) for r in rows), default=0) + 1
     data_str = str(results)
+    plan = plan or {}
     cache = {
         "id": cache_id,
         "条目编号": f"RESU-F{plan_id:04d}",
@@ -230,14 +323,22 @@ def _cache_query_result(plan_id: int, results: list[dict[str, Any]]) -> None:
         "status": "有效",
         "pending": True,
         "abnormal": False,
+        "批次编号": plan.get("批次编号"),
+        "模型版本": plan.get("模型版本"),
         "result_data": results,
     }
     rows.append(cache)
 
 
-def _audit_federated_query(plan_id: int, elapsed_ms: float, result_count: int) -> None:
+def _audit_federated_query(
+    plan_id: int,
+    elapsed_ms: float,
+    result_count: int,
+    plan: dict[str, Any] | None = None,
+) -> None:
     rows = store.rows("query_audit")
     audit_id = max((int(r.get("id", 0)) for r in rows), default=0) + 1
+    plan = plan or {}
     audit = {
         "id": audit_id,
         "记录编号": f"AUDIT-{uuid.uuid4().hex[:8]}",
@@ -251,6 +352,8 @@ def _audit_federated_query(plan_id: int, elapsed_ms: float, result_count: int) -
         "status": "正常" if elapsed_ms < 5000 else "慢查询",
         "pending": False,
         "abnormal": elapsed_ms > 30000,
+        "批次编号": plan.get("批次编号"),
+        "模型版本": plan.get("模型版本"),
     }
     rows.append(audit)
 
